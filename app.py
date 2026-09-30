@@ -60,3 +60,10 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# Initialize Session State
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "current_results" not in st.session_state:
+    st.session_state.current_results = None
+
