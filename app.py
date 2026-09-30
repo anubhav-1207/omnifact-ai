@@ -64,9 +64,9 @@ if "history" not in st.session_state:
 if "current_results" not in st.session_state:
     st.session_state.current_results = None
 
-# -----------------------------------------------------------------------------
-# 2. EMERGENCY BACKUP ENGINE & DATASETS
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------------
+# 2. DEEP DATASETS - ONLY FOR **CODE CUBICLE DEMO** INCASE **API LIMIT IS REACHED**
+# -------------------------------------------------------------------------------------------------------
 FALLBACK_DATASETS = {
     "Top AI/ML Lead Roles in Europe": [
         {"Company": "Anthropic", "Role": "Lead AI Engineer", "Location": "London, UK", "Est_Salary": "$180,000", "source_url": "https://anthropic.com", "confidence_score": "98%"},
