@@ -78,8 +78,7 @@ def get_gemini_client():
 
 def run_agentic_workflow(user_prompt: str, progress_bar, status_text, log_area):
     """
-    Multi-stage LLM Agent powered by Gemini 3.8 Flash with retry logic and
-    an emergency cache engine to safeguard against high-demand errors during demos.
+    Multi-stage LLM Agent powered by Gemini 3.8 Flash with robust JSON structure checking.
     """
     client = get_gemini_client()
     logs = []
@@ -135,17 +134,27 @@ def run_agentic_workflow(user_prompt: str, progress_bar, status_text, log_area):
     Analyze this request: "{user_prompt}"
     1. Identify the core entity being requested (e.g., Job, Company, Lead).
     2. Determine 4-5 optimal fields to extract for a clean dataset.
-    3. Return a JSON object formatted as: {{"entity": "...", "fields": ["field1", "field2", ...]}}
+    3. Return a single JSON object formatted as: {{"entity": "...", "fields": ["field1", "field2", ...]}}
     """
     
     plan_res = generate_with_gemini_38(plan_prompt, response_mime_type="application/json")
     try:
-        plan_data = json.loads(plan_res.text)
+        raw_plan = json.loads(plan_res.text)
+        # Fix list vs dict response type mismatch
+        if isinstance(raw_plan, list) and len(raw_plan) > 0:
+            plan_data = raw_plan[0] if isinstance(raw_plan[0], dict) else {"entity": "Target Entity", "fields": ["Company", "Role", "Location", "Est_Salary"]}
+        elif isinstance(raw_plan, dict):
+            plan_data = raw_plan
+        else:
+            plan_data = {"entity": "Target Entity", "fields": ["Company", "Role", "Location", "Est_Salary"]}
     except Exception:
         plan_data = {"entity": "Target Entity", "fields": ["Company", "Role", "Location", "Est_Salary"]}
         
-    log(f"Dynamic Schema Created for Entity: '{plan_data.get('entity', 'Target Entity')}'")
-    log(f"Target Fields: {', '.join(plan_data.get('fields', []))}")
+    entity_name = plan_data.get("entity", "Target Entity")
+    fields_list = plan_data.get("fields", ["Company", "Role", "Location", "Est_Salary"])
+    
+    log(f"Dynamic Schema Created for Entity: '{entity_name}'")
+    log(f"Target Fields: {', '.join(fields_list)}")
 
     # STAGE 2: EXECUTION & WEB RETRIEVAL
     status_text.text("Stage 2/3: Gathering & Filtering Permitted Web Sources...")
@@ -158,7 +167,7 @@ def run_agentic_workflow(user_prompt: str, progress_bar, status_text, log_area):
 
     Extract 5-8 highly accurate records.
     For each record, provide:
-    - {', '.join(plan_data.get('fields', ['field1', 'field2']))}
+    - {', '.join(fields_list)}
     - "source_url": A realistic domain URL backing this info.
     - "confidence_score": A rating between 85% and 100% based on source accuracy.
 
@@ -175,6 +184,9 @@ def run_agentic_workflow(user_prompt: str, progress_bar, status_text, log_area):
     time.sleep(0.5)
 
     extracted_records = json.loads(data_res.text)
+    if isinstance(extracted_records, dict):
+        extracted_records = [extracted_records]
+
     df = pd.DataFrame(extracted_records)
     
     progress_bar.progress(100)
