@@ -576,9 +576,68 @@ def validate_and_deduplicate(records, fields, logs, log_area):
 
 
 # -----------------------------------------------------------------------------
+# API failure classification
+# -----------------------------------------------------------------------------
+class GeminiQuotaError(RuntimeError):
+    """Raised when Gemini rejects a request because of quota/rate limiting."""
+
+
+def is_quota_error(exc):
+    """Detect common Gemini/API quota and rate-limit failures."""
+    status_code = getattr(exc, "status_code", None)
+    code = getattr(exc, "code", None)
+
+    # Google APIs commonly use HTTP 429 / RESOURCE_EXHAUSTED for quota limits.
+    if status_code == 429 or code == 429:
+        return True
+
+    message = str(exc).lower()
+    quota_markers = (
+        "resource_exhausted",
+        "resource exhausted",
+        "quota exceeded",
+        "quota_exceeded",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "too_many_requests",
+        "429",
+        "requests per minute",
+        "requests per day",
+        "tokens per minute",
+        "tokens per day",
+        "capacity",
+        "temporarily unavailable",
+    )
+    return any(marker in message for marker in quota_markers)
+
+
+def raise_if_quota_error(exc):
+    """Convert a quota/rate-limit exception into a user-facing exception."""
+    if is_quota_error(exc):
+        raise GeminiQuotaError(
+            "Gemini API quota or rate limit was reached. "
+            "Google is temporarily refusing requests because the API has "
+            "hit its usage limit or is under high demand. "
+            "Wait and retry, or use an API project/key with available quota."
+        ) from exc
+
+    raise exc
+
+
+# -----------------------------------------------------------------------------
 # Full workflow
 # -----------------------------------------------------------------------------
 def run_agentic_workflow(user_prompt, progress_bar, status_text, log_area):
+    try:
+        return _run_agentic_workflow(
+            user_prompt, progress_bar, status_text, log_area
+        )
+    except Exception as exc:
+        raise_if_quota_error(exc)
+
+
+def _run_agentic_workflow(user_prompt, progress_bar, status_text, log_area):
     client = get_client()
 
     if not client:
@@ -802,6 +861,35 @@ if run_btn and user_prompt.strip():
         st.session_state.current_results = result
         st.session_state.last_successful_results = result
         st.session_state.history.append(result)
+
+    except GeminiQuotaError as exc:
+        status_text.error("Gemini quota / rate limit reached.")
+        log_message(
+            [],
+            log_area,
+            f"QUOTA/RATE-LIMIT: {exc}",
+        )
+
+        st.error(
+            "⚠️ Gemini API quota or rate limit reached. "
+            "Google is refusing the request because the API usage limit was "
+            "reached or the service is experiencing high demand."
+        )
+        st.info(
+            "Try again later, reduce request frequency, or use a Gemini API "
+            "project/key with available quota."
+        )
+
+        # A previous result can still be displayed, but it is explicitly cached.
+        cached = st.session_state.last_successful_results
+        if cached:
+            st.warning(
+                "Showing the previous successful dataset as SESSION CACHE. "
+                "No new web research was performed."
+            )
+            cached_copy = dict(cached)
+            cached_copy["mode"] = "session-cache"
+            st.session_state.current_results = cached_copy
 
     except Exception as exc:
         status_text.error("Research run failed safely.")
