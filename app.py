@@ -105,7 +105,7 @@ def run_agentic_workflow(user_prompt: str, progress_bar, status_text, log_area):
     """
     
     plan_res = client.models.generate_content(
-        model="gemini-1.5-flash",
+        model="gemini-3.8-flash",
         contents=plan_prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json")
     )
@@ -132,7 +132,7 @@ def run_agentic_workflow(user_prompt: str, progress_bar, status_text, log_area):
     """
 
     data_res = client.models.generate_content(
-        model="gemini-1.5-flash",
+        model="gemini-3.8-flash",
         contents=extraction_prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
