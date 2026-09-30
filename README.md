@@ -1,6 +1,6 @@
 
 # ⚡ OmniExtract AI
-> **Agentic Web Intelligence Platform** — Transform natural-language queries into traceable, validated, production-ready datasets in seconds.
+**Agentic Web Intelligence Platform** — Transform natural-language queries into traceable, validated, production-ready datasets in seconds.
 
 ---
 
