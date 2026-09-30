@@ -67,8 +67,8 @@ OmniExtract AI operates across a 3-stage agentic pipeline:
 
 ### 1. Clone the Repository
 ```bash
-git clone [https://github.com/anubhav-1207/omnifact.git](https://github.com/anubhav-1207/omnifact.git)
-cd omnifact
+git clone [https://github.com/anubhav-1207/omnifact-ai.git](https://github.com/anubhav-1207/omnifact-ai.git)
+cd omnifact-ai
 ```
 ### 2. Install Dependencies
 ```
