@@ -1,17 +1,17 @@
 
-# ⚡ OmniExtract AI
+# OmniExtract AI
 **Agentic Web Intelligence Platform** — Transform natural-language queries into traceable, validated, production-ready datasets in seconds.
 
 ---
 
-## 📌 Problem Statement
+## Problem Statement
 Collecting structured web intelligence (such as recruitment leads, funding rounds, or sales prospects) currently suffers from two major flaws:
 1. **Brittle Traditional Scrapers:** Rely on hardcoded CSS/XPath selectors that break whenever target site layouts update.
 2. **LLM Hallucinations & Outages:** Raw generative responses often lack verifiable source attribution, and live web extraction pipelines break down completely during public cloud API rate limits or server overloads.
 
 ---
 
-## 🚀 The Solution
+## The Solution
 **OmniExtract AI** is an autonomous, agentic web intelligence platform that eliminates manual scraping and data cleanup. Users simply describe their target dataset in plain English, and the agent dynamically plans, extracts, validates, and formats the data into structured datasets.
 
 Key features include:
@@ -22,7 +22,7 @@ Key features include:
 
 ---
 
-## 🏗️ Agentic Execution Pipeline
+## Agentic Execution Pipeline
 
 OmniExtract AI operates across a 3-stage agentic pipeline:
 
@@ -32,7 +32,7 @@ OmniExtract AI operates across a 3-stage agentic pipeline:
 
 ---
 
-## ⚙️ Tech Stack
+## Tech Stack
 
 * **Frontend & Dashboard:** Streamlit (Custom Dark Theme UI)
 * **LLM Engine & Orchestration:** Google Gemini 3.8 Flash (`google-genai` SDK)
@@ -41,7 +41,7 @@ OmniExtract AI operates across a 3-stage agentic pipeline:
 
 ---
 
-## 🌟 Key Advantages
+## Key Advantages
 
 * **Zero-Breakage Architecture:** No fragile CSS/DOM selectors. Extraction relies on intent-driven LLM understanding.
 * **Production-Ready Exports:** Generates immediate CSV and JSON payloads for downstream CRMs, vector databases, or sales tools.
@@ -50,13 +50,7 @@ OmniExtract AI operates across a 3-stage agentic pipeline:
 
 ---
 
-## ⚠️ Current Limitations & Future Roadmap
-
-### Current Limitations:
-* **Rate Limits:** Depends on underlying cloud API quotas for live multi-page crawling.
-* **Depth Limitation:** Currently optimized for 10–20 high-confidence records per single prompt execution.
-
-### Future Roadmap:
+## Future Roadmap:
 * **Deep Crawling Integration:** Combine with Playwright or Selenium for multi-page JS-rendered extraction.
 * **Scheduled Webhooks:** Allow automated daily or weekly background extraction runs directly to Slack, email, or Webhooks.
 * **Vector Store Export:** Native 1-click push to Pinecone and Qdrant vector databases for RAG applications.
