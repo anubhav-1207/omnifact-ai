@@ -1,7 +1,10 @@
-
+j
 # OmniExtract AI
 **Agentic Web Intelligence Platform** — Transform natural-language queries into traceable, validated, production-ready datasets in seconds.
 
+Try OmniExtract AI : https://share.streamlit.io/-/auth/app?redirect_uri=https%3A%2F%2Fomnifact-ai-j8lzhqzlzcks8utmgcms6c.streamlit.app%2F
+### Note before trying:
+OmniExtract AI runs on a free gemini API and has very limited quota, hence if the dataset parsed was too big, the quota might be exceeded in just one single search. It clearly shows that the quota was exceeded when applicable and is not a bug!!
 ---
 
 ## Problem Statement
