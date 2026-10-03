@@ -117,10 +117,10 @@ for key, default in {
 # Check these names in Google AI Studio and edit the list if needed.
 MODELS = [
     "gemini-3.8-flash",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
 ]
-RETRIES_PER_MODEL = 3
+RETRIES_PER_MODEL = 2
 
 MAX_RECORDS = 8
 REQUEST_TIMEOUT = 10
