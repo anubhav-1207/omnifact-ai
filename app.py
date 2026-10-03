@@ -1,7 +1,9 @@
 import os
+import re
 import json
 import time
-import re
+import html
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -19,11 +21,11 @@ from google.genai import types
 #        ↓
 #   Schema planner
 #        ↓
-#   Gemini + Google Search grounding
+#   Gemini + Google Search grounding (with retry + model fallback)
 #        ↓
 #   Structured extraction + evidence
 #        ↓
-#   Deterministic validation
+#   Deterministic validation (source, reachability, quote-on-page check)
 #        ↓
 #   Deduplication
 #        ↓
@@ -111,9 +113,21 @@ for key, default in {
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-MODEL = "gemini-3.8-flash"
+# Tried in order. If one is busy (503) or missing (404), the next is used.
+# Check these names in Google AI Studio and edit the list if needed.
+MODELS = [
+    "gemini-3.8-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+RETRIES_PER_MODEL = 3
+
 MAX_RECORDS = 8
-REQUEST_TIMEOUT = 8
+REQUEST_TIMEOUT = 10
+MAX_PAGE_CHARS = 600_000
+URL_CHECK_WORKERS = 6
+
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; OmniExtractAI/1.0)"}
 
 api_key = os.getenv("GEMINI_API_KEY") or st.sidebar.text_input(
     "Gemini API Key", type="password"
@@ -162,6 +176,24 @@ def normalize_text(value):
     return re.sub(r"\s+", " ", str(value).strip()).lower()
 
 
+EMPTY_MARKERS = {"", "none", "null", "n/a", "na", "unknown", "nan"}
+
+
+def is_filled(value):
+    """True only for real values. None / 'null' / 'N/A' count as empty."""
+    if value is None:
+        return False
+    if isinstance(value, float) and value != value:  # NaN
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in EMPTY_MARKERS
+    return True
+
+
+def display_value(value):
+    return str(value) if is_filled(value) else "—"
+
+
 def extract_json(text):
     """Handle valid JSON plus occasional fenced JSON from a model."""
     if not text:
@@ -188,11 +220,7 @@ def extract_json(text):
 
 
 def get_grounding_sources(response):
-    """
-    Extract URLs/titles from Gemini grounding metadata.
-    The SDK exposes grounding metadata on the candidate in current
-    generate_content responses.
-    """
+    """Extract URLs/titles from Gemini grounding metadata."""
     sources = []
 
     try:
@@ -221,63 +249,159 @@ def get_grounding_sources(response):
         # Grounding data should enrich the result, not crash the application.
         pass
 
-    # De-duplicate source URLs.
     unique = {}
     for source in sources:
         unique[source["url"]] = source
     return list(unique.values())
 
 
-def validate_url(url):
-    """Cheap reachability check; does not claim semantic verification."""
-    url = clean_url(url)
-    if not url:
-        return False, "invalid URL"
+# -----------------------------------------------------------------------------
+# Grounding match (exact URL, or same domain)
+# -----------------------------------------------------------------------------
+REDIRECT_HOSTS = ("vertexaisearch.cloud.google.com",)
 
+
+def build_grounding_index(grounded_sources):
+    """
+    Gemini often returns redirect links as the URL and puts the real domain
+    in the title. So we keep both exact URLs and domains.
+    """
+    exact = set()
+    domains = set()
+
+    for source in grounded_sources:
+        url = clean_url(source.get("url", ""))
+        if url:
+            exact.add(url.rstrip("/"))
+            domain = domain_from_url(url)
+            if domain and domain not in REDIRECT_HOSTS:
+                domains.add(domain)
+
+        title = str(source.get("title", "") or "").strip().lower()
+        title = title.replace("www.", "")
+        if title and "." in title and " " not in title:
+            domains.add(title)
+
+    return exact, domains
+
+
+def domain_matches(domain, grounded_domains):
+    if not domain:
+        return False
+    for known in grounded_domains:
+        if (
+            domain == known
+            or domain.endswith("." + known)
+            or known.endswith("." + domain)
+        ):
+            return True
+    return False
+
+
+def grounding_match_type(source_url, exact, domains):
+    """Returns 'exact', 'domain' or None."""
+    if source_url.rstrip("/") in exact:
+        return "exact"
+    if domain_matches(domain_from_url(source_url), domains):
+        return "domain"
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Source fetching + quote verification
+# -----------------------------------------------------------------------------
+def fetch_page(url):
+    """Fetch once: reachability + page text for quote verification."""
     try:
         response = requests.get(
             url,
             timeout=REQUEST_TIMEOUT,
             allow_redirects=True,
-            headers={"User-Agent": "OmniExtractAI/1.0"},
+            headers=HTTP_HEADERS,
         )
         ok = 200 <= response.status_code < 400
-        return ok, f"HTTP {response.status_code}"
+        text = ""
+        content_type = response.headers.get("Content-Type", "").lower()
+        if ok and any(t in content_type for t in ("text", "html", "xml", "json")):
+            text = response.text[:MAX_PAGE_CHARS]
+        return {"ok": ok, "status": f"HTTP {response.status_code}", "text": text}
     except requests.RequestException as exc:
-        return False, type(exc).__name__
+        return {"ok": False, "status": type(exc).__name__, "text": ""}
 
 
-def deterministic_confidence(record, source_was_grounded, url_reachable):
+def _tokens(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _page_to_text(raw_html):
+    raw_html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw_html)
+    raw_html = re.sub(r"(?s)<[^>]+>", " ", raw_html)
+    return html.unescape(raw_html)
+
+
+def quote_in_page(quote, page_html):
     """
-    Evidence-derived score.
+    True  = quote found on page (exact, or at least 85% of its words).
+    False = page was readable but quote not found.
+    None  = could not check (no page text, or quote too short).
+    """
+    if not page_html:
+        return None
+
+    quote_tokens = _tokens(quote)
+    if len(quote_tokens) < 3:
+        return None
+
+    page_text = _page_to_text(page_html)
+    page_tokens = _tokens(page_text)
+    if not page_tokens:
+        return None
+
+    # Exact phrase match on normalised word streams.
+    if " ".join(quote_tokens) in " ".join(page_tokens):
+        return True
+
+    # Looser match: most of the quote's words appear on the page.
+    page_set = set(page_tokens)
+    hits = sum(1 for token in quote_tokens if token in page_set)
+    return hits / len(quote_tokens) >= 0.85
+
+
+def deterministic_confidence(record, match_type, url_reachable, quote_verified):
+    """
+    Evidence-derived score (max 99).
     This is deliberately deterministic and capped below 100%.
     It is NOT a claim that the factual content is guaranteed true.
+
+      valid URL ................ 15
+      grounding: exact 25, same-domain 15
+      evidence quote present ... 15
+      source reachable now ..... 10
+      quote found on the page .. 25
+      field completeness ....... up to 10
     """
     score = 0
 
-    # Source exists and has a valid URL.
     if clean_url(record.get("source_url")):
-        score += 20
-
-    # Gemini grounding actually returned this URL.
-    if source_was_grounded:
-        score += 30
-
-    # Evidence quote is present.
-    if len(str(record.get("evidence_quote", "")).strip()) >= 20:
-        score += 25
-
-    # Source is reachable now.
-    if url_reachable:
         score += 15
 
-    # Basic record completeness.
+    if match_type == "exact":
+        score += 25
+    elif match_type == "domain":
+        score += 15
+
+    if len(str(record.get("evidence_quote", "")).strip()) >= 20:
+        score += 15
+
+    if url_reachable:
+        score += 10
+
+    if quote_verified is True:
+        score += 25
+
     required = record.get("_fields", [])
     if required:
-        populated = sum(
-            bool(str(record.get(field, "")).strip())
-            for field in required
-        )
+        populated = sum(is_filled(record.get(field)) for field in required)
         score += round(10 * populated / len(required))
 
     return min(score, 99)
@@ -302,6 +426,105 @@ def deduplicate_records(records, fields):
             output.append(record)
 
     return output
+
+
+# -----------------------------------------------------------------------------
+# API failure classification + retry/fallback
+# -----------------------------------------------------------------------------
+class GeminiQuotaError(RuntimeError):
+    """Raised when Gemini is rate-limited, overloaded or unavailable."""
+
+
+def error_code(exc):
+    for attr in ("code", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def is_overloaded(exc):
+    """Quota, rate limit, or server overload (429 / 500 / 503 / 504)."""
+    if error_code(exc) in (429, 500, 503, 504):
+        return True
+
+    message = str(exc).lower()
+    markers = (
+        "resource_exhausted",
+        "resource exhausted",
+        "quota exceeded",
+        "quota_exceeded",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "requests per minute",
+        "requests per day",
+        "tokens per minute",
+        "tokens per day",
+        "unavailable",
+        "high demand",
+        "overloaded",
+    )
+    return any(marker in message for marker in markers)
+
+
+is_quota_error = is_overloaded
+
+
+def raise_if_quota_error(exc):
+    if is_overloaded(exc):
+        raise GeminiQuotaError(
+            "Gemini is rate-limited or overloaded right now. "
+            "All fallback models were tried. Wait a few minutes and retry, "
+            "or use an API key/project with available quota."
+        ) from exc
+    raise exc
+
+
+def generate_with_retry(client, logs, log_area, **kwargs):
+    """
+    Try each model in MODELS. Per model: retry with backoff on overload.
+    Missing model (404) -> skip to next model.
+    Any other error -> raise immediately.
+    Returns (response, model_used).
+    """
+    last_exc = None
+
+    for model in MODELS:
+        for attempt in range(1, RETRIES_PER_MODEL + 1):
+            try:
+                response = client.models.generate_content(model=model, **kwargs)
+                if model != MODELS[0]:
+                    log_message(logs, log_area, f"Using fallback model: {model}")
+                return response, model
+
+            except Exception as exc:
+                last_exc = exc
+
+                if error_code(exc) == 404:
+                    log_message(logs, log_area, f"{model} not found. Next model.")
+                    break
+
+                if not is_overloaded(exc):
+                    raise
+
+                if attempt < RETRIES_PER_MODEL:
+                    wait = 2 ** attempt
+                    log_message(
+                        logs,
+                        log_area,
+                        f"{model} busy (try {attempt}/{RETRIES_PER_MODEL}). "
+                        f"Waiting {wait}s...",
+                    )
+                    time.sleep(wait)
+                else:
+                    log_message(
+                        logs,
+                        log_area,
+                        f"{model} still busy after {RETRIES_PER_MODEL} tries.",
+                    )
+
+    raise last_exc
 
 
 # -----------------------------------------------------------------------------
@@ -331,8 +554,10 @@ Rules:
 - Optimize the schema for factual web research.
 """
 
-    response = client.models.generate_content(
-        model=MODEL,
+    response, _ = generate_with_retry(
+        client,
+        logs,
+        log_area,
         contents=plan_prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json"
@@ -399,6 +624,7 @@ SEARCH FOCUS:
 Use Google Search grounding to find current public web evidence.
 
 Return ONLY a JSON array containing up to {MAX_RECORDS} records.
+No text before or after the array. No markdown.
 
 Each record MUST have:
 - every requested field
@@ -420,18 +646,20 @@ CRITICAL EVIDENCE RULES:
 8. Return only records for which there is meaningful source evidence.
 """
 
-    response = client.models.generate_content(
-        model=MODEL,
+    # NOTE: no response_mime_type here. Many Gemini models refuse
+    # "JSON mode" and the Google Search tool in the same request.
+    # extract_json() already handles plain / fenced JSON.
+    response, model_used = generate_with_retry(
+        client,
+        logs,
+        log_area,
         contents=extraction_prompt,
         config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            tools=[
-                types.Tool(
-                    google_search=types.GoogleSearch()
-                )
-            ],
+            tools=[types.Tool(google_search=types.GoogleSearch())],
         ),
     )
+
+    log_message(logs, log_area, f"Extraction model: {model_used}")
 
     records = extract_json(response.text)
 
@@ -449,39 +677,27 @@ CRITICAL EVIDENCE RULES:
         f"Grounding returned {len(grounded_sources)} source(s).",
     )
 
-    grounded_urls = {
-        clean_url(source["url"]) for source in grounded_sources if source.get("url")
-    }
+    exact_urls, grounded_domains = build_grounding_index(grounded_sources)
 
-    cleaned = []
+    # ---- First pass: cheap checks, no network ------------------------------
+    candidates = []
+    rejected = 0
 
     for raw in records[:MAX_RECORDS]:
         if not isinstance(raw, dict):
+            rejected += 1
             continue
 
         record = dict(raw)
 
-        # Normalize source fields.
         source_url = clean_url(record.get("source_url", ""))
         record["source_url"] = source_url
         record["evidence_quote"] = str(record.get("evidence_quote", "") or "").strip()
         record["evidence_title"] = str(record.get("evidence_title", "") or "").strip()
         record["_fields"] = fields
 
-        # Only accept a source URL that actually appears in grounding metadata.
-        source_was_grounded = source_url in grounded_urls
-
-        # If the model returned a URL without exact normalization match,
-        # try matching by canonical URL string.
-        if not source_was_grounded and source_url:
-            source_was_grounded = any(
-                source_url.rstrip("/") == url.rstrip("/")
-                for url in grounded_urls
-            )
-
-        record["_source_grounded"] = source_was_grounded
-
         if not source_url or not record["evidence_quote"]:
+            rejected += 1
             log_message(
                 logs,
                 log_area,
@@ -489,48 +705,85 @@ CRITICAL EVIDENCE RULES:
             )
             continue
 
-        # Never silently substitute a source URL from nowhere.
-        if not source_was_grounded:
+        match_type = grounding_match_type(source_url, exact_urls, grounded_domains)
+
+        # Never accept a source that search did not actually return.
+        if match_type is None:
+            rejected += 1
             log_message(
                 logs,
                 log_area,
-                f"Rejected record: source was not present in grounding metadata ({domain_from_url(source_url)}).",
+                "Rejected record: source not in grounding metadata "
+                f"({domain_from_url(source_url)}).",
             )
             continue
 
-        reachable, status = validate_url(source_url)
-        record["_url_reachable"] = reachable
-        record["_url_status"] = status
+        record["_match"] = match_type
+        candidates.append(record)
+
+    # ---- Second pass: fetch each unique source once, in parallel -----------
+    unique_urls = list(dict.fromkeys(r["source_url"] for r in candidates))
+    pages = {}
+
+    if unique_urls:
+        log_message(
+            logs,
+            log_area,
+            f"Checking {len(unique_urls)} source page(s) and verifying quotes...",
+        )
+        workers = min(URL_CHECK_WORKERS, len(unique_urls))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for url, page in zip(unique_urls, pool.map(fetch_page, unique_urls)):
+                pages[url] = page
+
+    cleaned = []
+
+    for record in candidates:
+        page = pages.get(record["source_url"], {"ok": False, "status": "n/a", "text": ""})
+
+        quote_verified = quote_in_page(record["evidence_quote"], page["text"])
+
+        record["_url_reachable"] = page["ok"]
+        record["_url_status"] = page["status"]
+        record["_quote_verified"] = quote_verified
 
         record["confidence_score"] = deterministic_confidence(
             record,
-            source_was_grounded,
-            reachable,
+            record["_match"],
+            page["ok"],
+            quote_verified,
         )
 
         cleaned.append(record)
 
-    return cleaned, grounded_sources
+    return cleaned, grounded_sources, rejected
 
 
 # -----------------------------------------------------------------------------
 # Stage 3: validation + deduplication
 # -----------------------------------------------------------------------------
+def quote_label(value):
+    if value is True:
+        return "verified"
+    if value is False:
+        return "not found"
+    return "not checked"
+
+
 def validate_and_deduplicate(records, fields, logs, log_area):
     log_message(logs, log_area, "Running deterministic integrity checks...")
 
     valid = []
+    rejected = 0
 
     for record in records:
-        populated = sum(
-            bool(str(record.get(field, "")).strip())
-            for field in fields
-        )
+        populated = sum(is_filled(record.get(field)) for field in fields)
 
         # Require at least half the requested fields to be populated.
         minimum = max(1, len(fields) // 2)
 
         if populated < minimum:
+            rejected += 1
             log_message(
                 logs,
                 log_area,
@@ -539,113 +792,61 @@ def validate_and_deduplicate(records, fields, logs, log_area):
             continue
 
         if not record.get("source_url") or not record.get("evidence_quote"):
+            rejected += 1
             continue
 
         valid.append(record)
 
     before = len(valid)
     valid = deduplicate_records(valid, fields)
-    removed = before - len(valid)
+    duplicates = before - len(valid)
 
     log_message(
         logs,
         log_area,
-        f"Deduplication removed {removed} duplicate record(s).",
+        f"Deduplication removed {duplicates} duplicate record(s).",
     )
 
     # Remove internal columns before presenting the dataframe.
     public_records = []
 
     for record in valid:
-        public_record = {
-            field: record.get(field)
-            for field in fields
-        }
+        public_record = {field: record.get(field) for field in fields}
         public_record.update(
             {
                 "source_url": record.get("source_url", ""),
                 "evidence_title": record.get("evidence_title", ""),
                 "evidence_quote": record.get("evidence_quote", ""),
+                "grounding_match": record.get("_match", ""),
                 "source_reachable": bool(record.get("_url_reachable")),
+                "quote_verified": quote_label(record.get("_quote_verified")),
                 "confidence_score": record.get("confidence_score", 0),
             }
         )
         public_records.append(public_record)
 
-    return public_records
-
-
-# -----------------------------------------------------------------------------
-# API failure classification
-# -----------------------------------------------------------------------------
-class GeminiQuotaError(RuntimeError):
-    """Raised when Gemini rejects a request because of quota/rate limiting."""
-
-
-def is_quota_error(exc):
-    """Detect common Gemini/API quota and rate-limit failures."""
-    status_code = getattr(exc, "status_code", None)
-    code = getattr(exc, "code", None)
-
-    # Google APIs commonly use HTTP 429 / RESOURCE_EXHAUSTED for quota limits.
-    if status_code == 429 or code == 429:
-        return True
-
-    message = str(exc).lower()
-    quota_markers = (
-        "resource_exhausted",
-        "resource exhausted",
-        "quota exceeded",
-        "quota_exceeded",
-        "rate limit",
-        "rate_limit",
-        "too many requests",
-        "too_many_requests",
-        "429",
-        "requests per minute",
-        "requests per day",
-        "tokens per minute",
-        "tokens per day",
-        "capacity",
-        "temporarily unavailable",
-    )
-    return any(marker in message for marker in quota_markers)
-
-
-def raise_if_quota_error(exc):
-    """Convert a quota/rate-limit exception into a user-facing exception."""
-    if is_quota_error(exc):
-        raise GeminiQuotaError(
-            "Gemini API quota or rate limit was reached. "
-            "Google is temporarily refusing requests because the API has "
-            "hit its usage limit or is under high demand. "
-            "Wait and retry, or use an API project/key with available quota."
-        ) from exc
-
-    raise exc
+    return public_records, {"rejected": rejected, "duplicates": duplicates}
 
 
 # -----------------------------------------------------------------------------
 # Full workflow
 # -----------------------------------------------------------------------------
-def run_agentic_workflow(user_prompt, progress_bar, status_text, log_area):
+def run_agentic_workflow(user_prompt, progress_bar, status_text, log_area, logs):
     try:
         return _run_agentic_workflow(
-            user_prompt, progress_bar, status_text, log_area
+            user_prompt, progress_bar, status_text, log_area, logs
         )
     except Exception as exc:
         raise_if_quota_error(exc)
 
 
-def _run_agentic_workflow(user_prompt, progress_bar, status_text, log_area):
+def _run_agentic_workflow(user_prompt, progress_bar, status_text, log_area, logs):
     client = get_client()
 
     if not client:
         raise RuntimeError(
             "Gemini API key is missing or could not initialize the client."
         )
-
-    logs = []
 
     # Stage 1
     status_text.text("Stage 1/4 · Understanding request & designing schema")
@@ -663,7 +864,7 @@ def _run_agentic_workflow(user_prompt, progress_bar, status_text, log_area):
     status_text.text("Stage 2/4 · Searching the live web & collecting evidence")
     progress_bar.progress(40)
 
-    records, sources = grounded_extract(
+    records, sources, rejected_extract = grounded_extract(
         client,
         user_prompt,
         plan,
@@ -681,7 +882,7 @@ def _run_agentic_workflow(user_prompt, progress_bar, status_text, log_area):
     status_text.text("Stage 3/4 · Validating evidence & removing duplicates")
     progress_bar.progress(70)
 
-    final_records = validate_and_deduplicate(
+    final_records, stats = validate_and_deduplicate(
         records,
         plan["fields"],
         logs,
@@ -699,14 +900,15 @@ def _run_agentic_workflow(user_prompt, progress_bar, status_text, log_area):
     status_text.text("Stage 4/4 · Building auditable dataset")
     progress_bar.progress(90)
 
-    # Stable ordering.
     ordered_columns = (
         plan["fields"]
         + [
             "source_url",
             "evidence_title",
             "evidence_quote",
+            "grounding_match",
             "source_reachable",
+            "quote_verified",
             "confidence_score",
         ]
     )
@@ -718,12 +920,16 @@ def _run_agentic_workflow(user_prompt, progress_bar, status_text, log_area):
         else 0
     )
 
+    quotes_verified = int((df["quote_verified"] == "verified").sum())
+
     metrics = {
         "records": len(df),
         "sources": len(sources),
         "average_confidence": avg_confidence,
         "validated": len(df),
-        "duplicates_removed": len(records) - len(df),
+        "quotes_verified": quotes_verified,
+        "duplicates_removed": stats["duplicates"],
+        "rejected": rejected_extract + stats["rejected"],
     }
 
     progress_bar.progress(100)
@@ -732,6 +938,8 @@ def _run_agentic_workflow(user_prompt, progress_bar, status_text, log_area):
         logs,
         log_area,
         f"Completed: {len(df)} validated record(s), "
+        f"{quotes_verified} quote(s) verified on page, "
+        f"{metrics['rejected']} rejected, "
         f"{len(sources)} grounded source(s), "
         f"average evidence score {avg_confidence:.1f}%.",
     )
@@ -834,6 +1042,7 @@ if run_btn and user_prompt.strip():
     status_text = st.empty()
     log_expander = st.expander("Execution trace", expanded=True)
     log_area = log_expander.empty()
+    logs = []  # shared with the workflow so error lines are appended, not lost
 
     try:
         (
@@ -846,6 +1055,7 @@ if run_btn and user_prompt.strip():
             progress_bar,
             status_text,
             log_area,
+            logs,
         )
 
         result = {
@@ -863,24 +1073,18 @@ if run_btn and user_prompt.strip():
         st.session_state.history.append(result)
 
     except GeminiQuotaError as exc:
-        status_text.error("Gemini quota / rate limit reached.")
-        log_message(
-            [],
-            log_area,
-            f"QUOTA/RATE-LIMIT: {exc}",
-        )
+        status_text.error("Gemini rate limit / overload.")
+        log_message(logs, log_area, f"QUOTA/OVERLOAD: {exc}")
 
         st.error(
-            "⚠️ Gemini API quota or rate limit reached. "
-            "Google is refusing the request because the API usage limit was "
-            "reached or the service is experiencing high demand."
+            "⚠️ Gemini is rate-limited or overloaded. "
+            "Retries and fallback models were all tried."
         )
         st.info(
-            "Try again later, reduce request frequency, or use a Gemini API "
-            "project/key with available quota."
+            "Wait a few minutes and run again, or use an API key/project "
+            "with available quota."
         )
 
-        # A previous result can still be displayed, but it is explicitly cached.
         cached = st.session_state.last_successful_results
         if cached:
             st.warning(
@@ -893,14 +1097,9 @@ if run_btn and user_prompt.strip():
 
     except Exception as exc:
         status_text.error("Research run failed safely.")
-        log_message(
-            [],
-            log_area,
-            f"ERROR: {type(exc).__name__}: {exc}",
-        )
+        log_message(logs, log_area, f"ERROR: {type(exc).__name__}: {exc}")
 
         # Do NOT fabricate records.
-        # If there is a previous successful run, expose it explicitly as cache.
         cached = st.session_state.last_successful_results
 
         if cached:
@@ -933,7 +1132,7 @@ if st.session_state.current_results:
     if result.get("mode") == "session-cache":
         st.info("SESSION CACHE · This is not a new live research result.")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
 
     with c1:
         st.markdown(
@@ -959,15 +1158,23 @@ if st.session_state.current_results:
 
     with c4:
         st.markdown(
+            f'<div class="metric-card"><h4>Quotes Verified</h4>'
+            f'<h2>{metrics.get("quotes_verified", 0)}/{len(df)}</h2></div>',
+            unsafe_allow_html=True,
+        )
+
+    with c5:
+        st.markdown(
             f'<div class="metric-card"><h4>Duplicates Removed</h4>'
             f'<h2>{metrics.get("duplicates_removed", 0)}</h2></div>',
             unsafe_allow_html=True,
         )
 
     st.caption(
+        f"{metrics.get('rejected', 0)} record(s) were rejected by validation. "
         "Evidence Score is an application-derived signal based on source "
-        "grounding, evidence text, URL reachability and field completeness. "
-        "It is not a guarantee of factual correctness."
+        "grounding, evidence text, URL reachability, quote-on-page check and "
+        "field completeness. It is not a guarantee of factual correctness."
     )
 
     # -------------------------------------------------------------------------
@@ -1008,17 +1215,16 @@ if st.session_state.current_results:
 
     if not filtered_df.empty:
         for idx, row in filtered_df.reset_index(drop=True).iterrows():
-            label = row.get(
-                result["schema"]["fields"][0],
-                f"Record {idx + 1}",
-            )
+            label = row.get(result["schema"]["fields"][0])
+            if not is_filled(label):
+                label = f"Record {idx + 1}"
 
             with st.expander(f"{idx + 1}. {label}"):
                 left, right = st.columns([2, 1])
 
                 with left:
                     st.markdown("**Supporting evidence**")
-                    st.write(row.get("evidence_quote", "No quote returned."))
+                    st.write(row.get("evidence_quote") or "No quote returned.")
 
                     source_url = row.get("source_url", "")
                     if source_url:
@@ -1039,12 +1245,22 @@ if st.session_state.current_results:
                         else "🟠 Source not reachable during verification"
                     )
 
+                    verified = row.get("quote_verified", "not checked")
+                    if verified == "verified":
+                        st.write("🟢 Quote found on source page")
+                    elif verified == "not found":
+                        st.write("🟠 Quote not found on source page")
+                    else:
+                        st.write("⚪ Quote could not be checked")
+
+                    st.caption(f"Grounding match: {row.get('grounding_match', '—')}")
+
                 st.markdown("---")
 
                 for field in result["schema"]["fields"]:
                     st.markdown(
                         f"**{field.replace('_', ' ').title()}:** "
-                        f"{row.get(field, '')}"
+                        f"{display_value(row.get(field))}"
                     )
 
     # -------------------------------------------------------------------------
@@ -1058,7 +1274,7 @@ if st.session_state.current_results:
         st.download_button(
             "Download CSV",
             data=filtered_df.to_csv(index=False).encode("utf-8"),
-            file_name="omnifact_evidence_dataset.csv",
+            file_name="omniextract_evidence_dataset.csv",
             mime="text/csv",
             use_container_width=True,
         )
@@ -1071,7 +1287,7 @@ if st.session_state.current_results:
                 indent=2,
                 force_ascii=False,
             ),
-            file_name="omnifact_evidence_dataset.json",
+            file_name="omniextract_evidence_dataset.json",
             mime="application/json",
             use_container_width=True,
         )
